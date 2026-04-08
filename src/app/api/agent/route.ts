@@ -12,34 +12,42 @@ export async function POST(req: Request) {
     .map((line: string, i: number) => `${String(i + 1).padStart(3)}: ${line}`)
     .join("\n");
 
-  const systemPrompt = `You are a coding assistant embedded in a vim-like editor. The user will ask you to write or modify code in their buffer.
-
-BUFFER (${totalLines} lines total, cursor on line ${cursor_line}):
+  const bufferContext = `BUFFER (${totalLines} lines total, cursor on line ${cursor_line}):
 \`\`\`
 ${numberedBuffer || "(empty)"}
-\`\`\`
+\`\`\``;
+
+  const codeSystemPrompt = `You are a coding assistant embedded in a vim-like editor. The user will ask you to write or modify code in their buffer.
+
+${bufferContext}
 
 TOOL USAGE RULES:
-- Call write_code to write or modify code in the buffer. You may call it MULTIPLE TIMES to write in different locations.
+- You MUST call the write_code tool to write code in the buffer.
+- You may call it MULTIPLE TIMES to write in different locations.
 - When making multiple write_code calls, work from bottom to top so earlier inserts don't shift the line numbers of later targets.
 - line_start is 1-based (line 1 = first line of the buffer).
 - "insert" mode: new lines are ADDED BEFORE line_start, pushing existing lines down. Existing lines are NOT modified or removed.
 - "overwrite" mode: lines starting at line_start are REPLACED with your content. Use this to modify existing lines.
 - To add code at the end of the buffer, use INSERT at line ${totalLines + 1}.
 - Be precise with line numbers. Double-check which line you are targeting.
-- Preserve the indentation style already used in the buffer.
-- You MUST call BOTH write_code AND explain_code tools together in parallel.
-- Always explain what the code does, why you made certain choices, and how it works. Write in a conversational, teacher-like tone.`;
+- Preserve the indentation style already used in the buffer.`;
+
+  const explainSystemPrompt = `You are a coding assistant embedded in a vim-like editor. The user asked you to write code. Your job is to explain the code you would write for their request.
+
+${bufferContext}
+
+RULES:
+- You MUST call the explain_code tool.
+- Explain what the code does, why you made certain choices, and how it works.
+- Write in a conversational, teacher-like tone. Use short paragraphs.`;
 
   const encoder = new TextEncoder();
 
-  const result = streamText({
+  // Launch two parallel API calls so code and explanation stream simultaneously
+  const codeResult = streamText({
     model: openai.chat("gpt-5.4"),
-    system: systemPrompt,
+    system: codeSystemPrompt,
     prompt,
-    providerOptions: {
-      openai: { parallelToolCalls: true },
-    },
     tools: {
       write_code: tool({
         description:
@@ -50,9 +58,17 @@ TOOL USAGE RULES:
           content: z.string().describe("The code/text to write. Multiple lines separated by newlines."),
         }),
       }),
+    },
+  });
+
+  const explainResult = streamText({
+    model: openai.chat("gpt-5.4"),
+    system: explainSystemPrompt,
+    prompt,
+    tools: {
       explain_code: tool({
         description:
-          "Explain the code you are writing or modifying. Call this alongside write_code to narrate what the code does, why you made certain choices, and how it works. Write in a conversational, teacher-like tone. Use short paragraphs.",
+          "Explain the code you are writing. Narrate what the code does, why you made certain choices, and how it works. Write in a conversational, teacher-like tone. Use short paragraphs.",
         inputSchema: z.object({
           explanation: z.string().describe("A clear, conversational explanation of the code being written."),
         }),
@@ -69,47 +85,34 @@ TOOL USAGE RULES:
       }
 
       // Send 2KB padding comment to force any compression buffers to flush.
-      // Turbopack's dev server may gzip-buffer the response; this primes the pipe.
       controller.enqueue(
         encoder.encode(`: ${"x".repeat(2048)}\n\n`)
       );
 
-      // Track per-tool-call streaming state
-      const calls = new Map<
-        string,
-        {
-          toolName: string;
-          json: string;
-          // write_code incremental state
-          metaSent: boolean;
-          mode: string | null;
-          lineStart: number | null;
-          contentStarted: boolean;
-          contentBuffer: string;
-          linesSent: number;
-          // explain_code incremental state
-          explainStarted: boolean;
-          explainBuffer: string;
-          explainSent: number;
-        }
-      >();
+      // ---- Code stream processor ----
+      async function processCodeStream() {
+        const calls = new Map<
+          string,
+          {
+            json: string;
+            metaSent: boolean;
+            mode: string | null;
+            lineStart: number | null;
+            contentBuffer: string;
+            linesSent: number;
+          }
+        >();
 
-      try {
-        for await (const event of result.fullStream) {
+        for await (const event of codeResult.fullStream) {
           switch (event.type) {
             case "tool-input-start": {
               calls.set(event.id, {
-                toolName: event.toolName,
                 json: "",
                 metaSent: false,
                 mode: null,
                 lineStart: null,
-                contentStarted: false,
                 contentBuffer: "",
                 linesSent: 0,
-                explainStarted: false,
-                explainBuffer: "",
-                explainSent: 0,
               });
               break;
             }
@@ -120,52 +123,33 @@ TOOL USAGE RULES:
 
               state.json += event.delta;
 
-              if (state.toolName === "write_code") {
-                if (state.mode === null) {
-                  const m = state.json.match(/"mode"\s*:\s*"(insert|overwrite)"/);
-                  if (m) state.mode = m[1];
-                }
-                if (state.lineStart === null) {
-                  const m = state.json.match(/"line_start"\s*:\s*(\d+)/);
-                  if (m) state.lineStart = parseInt(m[1]);
+              if (state.mode === null) {
+                const m = state.json.match(/"mode"\s*:\s*"(insert|overwrite)"/);
+                if (m) state.mode = m[1];
+              }
+              if (state.lineStart === null) {
+                const m = state.json.match(/"line_start"\s*:\s*(\d+)/);
+                if (m) state.lineStart = parseInt(m[1]);
+              }
+
+              if (state.mode && state.lineStart !== null) {
+                if (!state.metaSent) {
+                  send("meta", { mode: state.mode, line_start: state.lineStart });
+                  state.metaSent = true;
                 }
 
-                if (state.mode && state.lineStart !== null) {
-                  if (!state.metaSent) {
-                    send("meta", { mode: state.mode, line_start: state.lineStart });
-                    state.metaSent = true;
-                  }
-
-                  const contentMatch = state.json.match(/"content"\s*:\s*"/);
-                  if (contentMatch) {
-                    const valueStart = contentMatch.index! + contentMatch[0].length;
-                    state.contentStarted = true;
-                    state.contentBuffer = parsePartialJsonString(
-                      state.json.slice(valueStart)
-                    );
-                  }
-
-                  const lines = state.contentBuffer.split("\n");
-                  while (state.linesSent < lines.length - 1) {
-                    send("line", { text: lines[state.linesSent] });
-                    state.linesSent++;
-                  }
-                }
-              } else if (state.toolName === "explain_code") {
-                const explainMatch = state.json.match(/"explanation"\s*:\s*"/);
-                if (explainMatch) {
-                  const valueStart = explainMatch.index! + explainMatch[0].length;
-                  state.explainStarted = true;
-                  state.explainBuffer = parsePartialJsonString(
+                const contentMatch = state.json.match(/"content"\s*:\s*"/);
+                if (contentMatch) {
+                  const valueStart = contentMatch.index! + contentMatch[0].length;
+                  state.contentBuffer = parsePartialJsonString(
                     state.json.slice(valueStart)
                   );
                 }
 
-                if (state.explainBuffer.length > state.explainSent) {
-                  send("explain_delta", {
-                    text: state.explainBuffer.slice(state.explainSent),
-                  });
-                  state.explainSent = state.explainBuffer.length;
+                const lines = state.contentBuffer.split("\n");
+                while (state.linesSent < lines.length - 1) {
+                  send("line", { text: lines[state.linesSent] });
+                  state.linesSent++;
                 }
               }
               break;
@@ -173,46 +157,29 @@ TOOL USAGE RULES:
 
             case "tool-call": {
               const state = calls.get(event.toolCallId);
+              const input = event.input as {
+                mode: "insert" | "overwrite";
+                line_start: number;
+                content: string;
+              };
 
-              if (event.toolName === "write_code") {
-                const input = event.input as {
-                  mode: "insert" | "overwrite";
-                  line_start: number;
-                  content: string;
-                };
-
-                if (state) {
-                  const lines = input.content.split("\n");
-                  if (!state.metaSent) {
-                    send("meta", { mode: input.mode, line_start: input.line_start });
-                  }
-                  for (let i = state.linesSent; i < lines.length; i++) {
-                    send("line", { text: lines[i] });
-                  }
-                } else {
+              if (state) {
+                const lines = input.content.split("\n");
+                if (!state.metaSent) {
                   send("meta", { mode: input.mode, line_start: input.line_start });
-                  for (const line of input.content.split("\n")) {
-                    send("line", { text: line });
-                  }
                 }
-
-                send("write_done", {});
-                send("tool_call", { tool: event.toolName, args: input });
-              } else if (event.toolName === "explain_code") {
-                const input = event.input as { explanation: string };
-
-                if (state && state.explainSent < input.explanation.length) {
-                  send("explain_delta", {
-                    text: input.explanation.slice(state.explainSent),
-                  });
-                } else if (!state) {
-                  send("explain_delta", { text: input.explanation });
+                for (let i = state.linesSent; i < lines.length; i++) {
+                  send("line", { text: lines[i] });
                 }
-
-                send("explain_done", {});
-                send("tool_call", { tool: event.toolName, args: input });
+              } else {
+                send("meta", { mode: input.mode, line_start: input.line_start });
+                for (const line of input.content.split("\n")) {
+                  send("line", { text: line });
+                }
               }
 
+              send("write_done", {});
+              send("tool_call", { tool: "write_code", args: input });
               calls.delete(event.toolCallId);
               break;
             }
@@ -220,11 +187,78 @@ TOOL USAGE RULES:
             case "error":
               send("error", { message: String(event.error) });
               break;
-            case "finish":
-              send("done", {});
+          }
+        }
+      }
+
+      // ---- Explain stream processor ----
+      async function processExplainStream() {
+        let json = "";
+        let explainBuffer = "";
+        let explainSent = 0;
+        let started = false;
+
+        for await (const event of explainResult.fullStream) {
+          switch (event.type) {
+            case "tool-input-delta": {
+              json += event.delta;
+
+              const explainMatch = json.match(/"explanation"\s*:\s*"/);
+              if (explainMatch) {
+                const valueStart = explainMatch.index! + explainMatch[0].length;
+                started = true;
+                explainBuffer = parsePartialJsonString(json.slice(valueStart));
+              }
+
+              if (explainBuffer.length > explainSent) {
+                send("explain_delta", {
+                  text: explainBuffer.slice(explainSent),
+                });
+                explainSent = explainBuffer.length;
+              }
+              break;
+            }
+
+            case "tool-call": {
+              const input = event.input as { explanation: string };
+
+              if (explainSent < input.explanation.length) {
+                send("explain_delta", {
+                  text: input.explanation.slice(explainSent),
+                });
+              }
+
+              send("explain_done", {});
+              send("tool_call", { tool: "explain_code", args: input });
+              break;
+            }
+
+            // If model generates text instead of using the tool, stream that
+            case "text-delta": {
+              if (!started) {
+                started = true;
+              }
+              send("explain_delta", { text: event.text });
+              explainSent += event.text.length;
+              break;
+            }
+
+            case "error":
+              send("error", { message: String(event.error) });
               break;
           }
         }
+
+        // If explain finished via text (no tool call), still send done
+        if (started && explainSent > 0) {
+          send("explain_done", {});
+        }
+      }
+
+      try {
+        // Run both streams concurrently — this is what makes them parallel
+        await Promise.all([processCodeStream(), processExplainStream()]);
+        send("done", {});
       } catch (err) {
         send("error", { message: String(err) });
       } finally {
