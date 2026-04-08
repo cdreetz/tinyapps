@@ -1,66 +1,14 @@
-import { NextRequest } from "next/server";
-import OpenAI from "openai";
+import { streamText, tool } from "ai";
+import { openai } from "@ai-sdk/openai";
+import { z } from "zod";
 
 export const dynamic = "force-dynamic";
 
-const client = new OpenAI();
-
-const tools: OpenAI.Responses.Tool[] = [
-  {
-    type: "function",
-    name: "write_code",
-    description:
-      "Write code into the editor buffer. 'insert' mode adds new lines BEFORE line_start, pushing all existing lines down (no existing lines are removed). 'overwrite' mode replaces existing lines starting at line_start with the provided content. line_start is 1-based.",
-    parameters: {
-      type: "object",
-      properties: {
-        mode: {
-          type: "string",
-          enum: ["insert", "overwrite"],
-          description:
-            "insert = add new lines at line_start, pushing existing content down. overwrite = replace lines starting at line_start.",
-        },
-        line_start: {
-          type: "number",
-          description: "1-based line number where the write begins.",
-        },
-        content: {
-          type: "string",
-          description:
-            "The code/text to write. Multiple lines separated by newlines.",
-        },
-      },
-      required: ["mode", "line_start", "content"],
-      additionalProperties: false,
-    },
-    strict: true,
-  },
-  {
-    type: "function",
-    name: "explain_code",
-    description:
-      "Explain the code you are writing or modifying. Call this alongside write_code to narrate what the code does, why you made certain choices, and how it works. Write in a conversational, teacher-like tone. Use short paragraphs.",
-    parameters: {
-      type: "object",
-      properties: {
-        explanation: {
-          type: "string",
-          description:
-            "A clear, conversational explanation of the code being written.",
-        },
-      },
-      required: ["explanation"],
-      additionalProperties: false,
-    },
-    strict: true,
-  },
-];
-
-export async function POST(req: NextRequest) {
+export async function POST(req: Request) {
   const { prompt, buffer, cursor_line } = await req.json();
 
-  const totalLines = buffer.length;
-  const numberedBuffer = buffer
+  const totalLines = (buffer as string[]).length;
+  const numberedBuffer = (buffer as string[])
     .map((line: string, i: number) => `${String(i + 1).padStart(3)}: ${line}`)
     .join("\n");
 
@@ -72,177 +20,219 @@ ${numberedBuffer || "(empty)"}
 \`\`\`
 
 TOOL USAGE RULES:
-- You MUST call BOTH write_code AND explain_code tools together in parallel.
-- You may call write_code MULTIPLE TIMES in a single response if you need to write code in different places in the file. For example, adding an import at line 1 and a function at line 20 should be two separate write_code calls.
+- Call write_code to write or modify code in the buffer. You may call it MULTIPLE TIMES to write in different locations.
 - When making multiple write_code calls, work from bottom to top so earlier inserts don't shift the line numbers of later targets.
 - line_start is 1-based (line 1 = first line of the buffer).
 - "insert" mode: new lines are ADDED BEFORE line_start, pushing existing lines down. Existing lines are NOT modified or removed.
 - "overwrite" mode: lines starting at line_start are REPLACED with your content. Use this to modify existing lines.
-- To add a docstring inside a function that starts on line N, use INSERT at line N+1 (the line AFTER the def).
 - To add code at the end of the buffer, use INSERT at line ${totalLines + 1}.
 - Be precise with line numbers. Double-check which line you are targeting.
-- Preserve the indentation style already used in the buffer.`;
+- Preserve the indentation style already used in the buffer.
+- You MUST call BOTH write_code AND explain_code tools together in parallel.
+- Always explain what the code does, why you made certain choices, and how it works. Write in a conversational, teacher-like tone.`;
 
   const encoder = new TextEncoder();
 
-  const stream = new ReadableStream({
-    async start(controller) {
-      function send(event: string, data: unknown) {
-        controller.enqueue(
-          encoder.encode(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`)
-        );
+  const result = streamText({
+    model: openai.chat("gpt-5.4"),
+    system: systemPrompt,
+    prompt,
+    providerOptions: {
+      openai: { parallelToolCalls: true },
+    },
+    tools: {
+      write_code: tool({
+        description:
+          "Write code into the editor buffer. 'insert' mode adds new lines BEFORE line_start, pushing all existing lines down. 'overwrite' mode replaces existing lines starting at line_start.",
+        inputSchema: z.object({
+          mode: z.enum(["insert", "overwrite"]),
+          line_start: z.number().describe("1-based line number where the write begins."),
+          content: z.string().describe("The code/text to write. Multiple lines separated by newlines."),
+        }),
+      }),
+      explain_code: tool({
+        description:
+          "Explain the code you are writing or modifying. Call this alongside write_code to narrate what the code does, why you made certain choices, and how it works. Write in a conversational, teacher-like tone. Use short paragraphs.",
+        inputSchema: z.object({
+          explanation: z.string().describe("A clear, conversational explanation of the code being written."),
+        }),
+      }),
+    },
+  });
+
+  const { readable, writable } = new TransformStream();
+  const writer = writable.getWriter();
+
+  async function send(event: string, data: unknown) {
+    await writer.write(
+      encoder.encode(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`)
+    );
+  }
+
+  // Process fullStream in background, writing SSE events to the transform stream
+  (async () => {
+    // Track per-tool-call streaming state
+    const calls = new Map<
+      string,
+      {
+        toolName: string;
+        json: string;
+        // write_code incremental state
+        metaSent: boolean;
+        mode: string | null;
+        lineStart: number | null;
+        contentStarted: boolean;
+        contentBuffer: string;
+        linesSent: number;
+        // explain_code incremental state
+        explainStarted: boolean;
+        explainBuffer: string;
+        explainSent: number;
       }
+    >();
 
-      try {
-        const response = await client.responses.create({
-          model: "gpt-5.4",
-          instructions: systemPrompt,
-          input: [{ role: "user", content: prompt }],
-          tools,
-          stream: true,
-        });
-
-        // Track per-tool-call state by output_index
-        const calls: Map<
-          number,
-          {
-            tool: "write_code" | "explain_code";
-            args: string;
-            // write_code state
-            mode: string | null;
-            line_start: number | null;
-            contentStarted: boolean;
-            contentBuffer: string;
-            linesSent: number;
-            // explain_code state
-            explainStarted: boolean;
-            explainBuffer: string;
-            explainSent: number;
-          }
-        > = new Map();
-
-        for await (const event of response) {
-          if (event.type === "response.output_item.added") {
-            const item = event.item;
-            if (
-              item.type === "function_call" &&
-              (item.name === "write_code" || item.name === "explain_code")
-            ) {
-              calls.set(event.output_index, {
-                tool: item.name,
-                args: "",
-                mode: null,
-                line_start: null,
-                contentStarted: false,
-                contentBuffer: "",
-                linesSent: 0,
-                explainStarted: false,
-                explainBuffer: "",
-                explainSent: 0,
-              });
-            }
+    try {
+      for await (const event of result.fullStream) {
+        switch (event.type) {
+          case "tool-input-start": {
+            calls.set(event.id, {
+              toolName: event.toolName,
+              json: "",
+              metaSent: false,
+              mode: null,
+              lineStart: null,
+              contentStarted: false,
+              contentBuffer: "",
+              linesSent: 0,
+              explainStarted: false,
+              explainBuffer: "",
+              explainSent: 0,
+            });
+            break;
           }
 
-          if (event.type === "response.function_call_arguments.delta") {
-            const state = calls.get(event.output_index);
-            if (!state) continue;
+          case "tool-input-delta": {
+            const state = calls.get(event.id);
+            if (!state) break;
 
-            state.args += event.delta;
+            state.json += event.delta;
 
-            if (state.tool === "write_code") {
+            if (state.toolName === "write_code") {
               if (state.mode === null) {
-                const modeMatch = state.args.match(/"mode"\s*:\s*"(insert|overwrite)"/);
-                if (modeMatch) state.mode = modeMatch[1];
+                const m = state.json.match(/"mode"\s*:\s*"(insert|overwrite)"/);
+                if (m) state.mode = m[1];
               }
-              if (state.line_start === null) {
-                const lineMatch = state.args.match(/"line_start"\s*:\s*(\d+)/);
-                if (lineMatch) state.line_start = parseInt(lineMatch[1]);
+              if (state.lineStart === null) {
+                const m = state.json.match(/"line_start"\s*:\s*(\d+)/);
+                if (m) state.lineStart = parseInt(m[1]);
               }
 
-              if (state.mode && state.line_start !== null) {
-                if (!state.contentStarted) {
-                  const contentIdx = state.args.indexOf('"content":"');
-                  if (contentIdx !== -1) {
-                    state.contentStarted = true;
-                    send("meta", { mode: state.mode, line_start: state.line_start });
-                    const afterKey = state.args.slice(contentIdx + '"content":"'.length);
-                    state.contentBuffer = parsePartialJsonString(afterKey);
-                  }
-                } else {
-                  const contentIdx = state.args.indexOf('"content":"');
-                  const afterKey = state.args.slice(contentIdx + '"content":"'.length);
-                  state.contentBuffer = parsePartialJsonString(afterKey);
+              if (state.mode && state.lineStart !== null) {
+                if (!state.metaSent) {
+                  await send("meta", { mode: state.mode, line_start: state.lineStart });
+                  state.metaSent = true;
+                }
+
+                const contentMatch = state.json.match(/"content"\s*:\s*"/);
+                if (contentMatch) {
+                  const valueStart = contentMatch.index! + contentMatch[0].length;
+                  state.contentStarted = true;
+                  state.contentBuffer = parsePartialJsonString(
+                    state.json.slice(valueStart)
+                  );
                 }
 
                 const lines = state.contentBuffer.split("\n");
                 while (state.linesSent < lines.length - 1) {
-                  send("line", { text: lines[state.linesSent] });
+                  await send("line", { text: lines[state.linesSent] });
                   state.linesSent++;
                 }
               }
-            } else if (state.tool === "explain_code") {
-              if (!state.explainStarted) {
-                const idx = state.args.indexOf('"explanation":"');
-                if (idx !== -1) {
-                  state.explainStarted = true;
-                  const afterKey = state.args.slice(idx + '"explanation":"'.length);
-                  state.explainBuffer = parsePartialJsonString(afterKey);
-                }
-              } else {
-                const idx = state.args.indexOf('"explanation":"');
-                const afterKey = state.args.slice(idx + '"explanation":"'.length);
-                state.explainBuffer = parsePartialJsonString(afterKey);
+            } else if (state.toolName === "explain_code") {
+              const explainMatch = state.json.match(/"explanation"\s*:\s*"/);
+              if (explainMatch) {
+                const valueStart = explainMatch.index! + explainMatch[0].length;
+                state.explainStarted = true;
+                state.explainBuffer = parsePartialJsonString(
+                  state.json.slice(valueStart)
+                );
               }
 
               if (state.explainBuffer.length > state.explainSent) {
-                const delta = state.explainBuffer.slice(state.explainSent);
-                send("explain_delta", { text: delta });
+                await send("explain_delta", {
+                  text: state.explainBuffer.slice(state.explainSent),
+                });
                 state.explainSent = state.explainBuffer.length;
               }
             }
+            break;
           }
 
-          if (event.type === "response.function_call_arguments.done") {
-            const state = calls.get(event.output_index);
-            if (!state) continue;
+          case "tool-call": {
+            const state = calls.get(event.toolCallId);
 
-            // Emit debug tool_call event with final parsed args
-            try {
-              const parsedArgs = JSON.parse(state.args);
-              send("tool_call", { tool: state.tool, args: parsedArgs });
-            } catch {
-              send("tool_call", { tool: state.tool, args: { _raw: state.args } });
+            if (event.toolName === "write_code") {
+              const input = event.input as {
+                mode: "insert" | "overwrite";
+                line_start: number;
+                content: string;
+              };
+
+              if (state) {
+                const lines = input.content.split("\n");
+                if (!state.metaSent) {
+                  await send("meta", { mode: input.mode, line_start: input.line_start });
+                }
+                for (let i = state.linesSent; i < lines.length; i++) {
+                  await send("line", { text: lines[i] });
+                }
+              } else {
+                await send("meta", { mode: input.mode, line_start: input.line_start });
+                for (const line of input.content.split("\n")) {
+                  await send("line", { text: line });
+                }
+              }
+
+              await send("write_done", {});
+              await send("tool_call", { tool: event.toolName, args: input });
+            } else if (event.toolName === "explain_code") {
+              const input = event.input as { explanation: string };
+
+              if (state && state.explainSent < input.explanation.length) {
+                await send("explain_delta", {
+                  text: input.explanation.slice(state.explainSent),
+                });
+              } else if (!state) {
+                await send("explain_delta", { text: input.explanation });
+              }
+
+              await send("explain_done", {});
+              await send("tool_call", { tool: event.toolName, args: input });
             }
 
-            if (state.tool === "write_code") {
-              const lines = state.contentBuffer.split("\n");
-              if (state.linesSent < lines.length) {
-                send("line", { text: lines[state.linesSent] });
-                state.linesSent++;
-              }
-              send("write_done", { output_index: event.output_index });
-            } else if (state.tool === "explain_code") {
-              if (state.explainBuffer.length > state.explainSent) {
-                const delta = state.explainBuffer.slice(state.explainSent);
-                send("explain_delta", { text: delta });
-              }
-              send("explain_done", {});
-            }
+            calls.delete(event.toolCallId);
+            break;
           }
+
+          case "error":
+            await send("error", { message: String(event.error) });
+            break;
+          case "finish":
+            await send("done", {});
+            break;
         }
-
-        send("done", {});
-      } catch (err) {
-        send("error", { message: String(err) });
-      } finally {
-        controller.close();
       }
-    },
-  });
+    } catch (err) {
+      await send("error", { message: String(err) });
+    } finally {
+      await writer.close();
+    }
+  })();
 
-  return new Response(stream, {
+  return new Response(readable, {
     headers: {
       "Content-Type": "text/event-stream",
+      "Content-Encoding": "identity",
       "Cache-Control": "no-cache, no-transform",
       "X-Accel-Buffering": "no",
     },
@@ -257,10 +247,10 @@ function parsePartialJsonString(raw: string): string {
   }
 
   return s
+    .replace(/\\\\/g, "\\")
     .replace(/\\n/g, "\n")
     .replace(/\\t/g, "\t")
     .replace(/\\r/g, "\r")
-    .replace(/\\\\/g, "\\")
     .replace(/\\"/g, '"')
     .replace(/\\\//g, "/");
 }

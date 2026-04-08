@@ -1,6 +1,7 @@
 "use client";
 
 import { useState, useEffect, useCallback, useRef } from "react";
+import { flushSync } from "react-dom";
 
 type Mode = "normal" | "insert" | "command" | "visual";
 
@@ -97,20 +98,22 @@ export default function VimTerminal({ onExplainDelta, onExplainStart, onExplainD
                 const text: string = data.text;
                 const mode_ = currentMode;
                 const base = currentLineStart;
-                setLines((prev) => {
-                  const ls = [...prev];
-                  const targetRow = base + linesWrittenRef.current;
-                  if (mode_ === "insert") {
-                    ls.splice(targetRow, 0, text);
-                  } else {
-                    if (targetRow < ls.length) {
-                      ls[targetRow] = text;
+                flushSync(() => {
+                  setLines((prev) => {
+                    const ls = [...prev];
+                    const targetRow = base + linesWrittenRef.current;
+                    if (mode_ === "insert") {
+                      ls.splice(targetRow, 0, text);
                     } else {
-                      ls.push(text);
+                      if (targetRow < ls.length) {
+                        ls[targetRow] = text;
+                      } else {
+                        ls.push(text);
+                      }
                     }
-                  }
-                  linesWrittenRef.current++;
-                  return ls;
+                    linesWrittenRef.current++;
+                    return ls;
+                  });
                 });
                 break;
               }
@@ -126,7 +129,9 @@ export default function VimTerminal({ onExplainDelta, onExplainStart, onExplainD
                 onToolCall?.(data.tool, data.args);
                 break;
               case "explain_delta":
-                onExplainDelta?.(data.text);
+                flushSync(() => {
+                  onExplainDelta?.(data.text);
+                });
                 break;
               case "explain_done":
                 onExplainDone?.();
