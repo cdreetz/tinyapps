@@ -148,7 +148,7 @@ export default function VimTerminal({ onExplainDelta, onExplainStart, onExplainD
             // paint is actually composited on screen. Without this, multiple
             // events that arrive in the same reader.read() chunk would all
             // render in a single paint, defeating the token-by-token effect.
-            await new Promise((r) => requestAnimationFrame(r));
+            await new Promise((r) => setTimeout(r, 0));
           }
         }
       } catch (err) {
