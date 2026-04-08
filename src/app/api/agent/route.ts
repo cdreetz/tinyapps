@@ -60,180 +60,185 @@ TOOL USAGE RULES:
     },
   });
 
-  const { readable, writable } = new TransformStream();
-  const writer = writable.getWriter();
-
-  async function send(event: string, data: unknown) {
-    await writer.write(
-      encoder.encode(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`)
-    );
-  }
-
-  // Process fullStream in background, writing SSE events to the transform stream
-  (async () => {
-    // Track per-tool-call streaming state
-    const calls = new Map<
-      string,
-      {
-        toolName: string;
-        json: string;
-        // write_code incremental state
-        metaSent: boolean;
-        mode: string | null;
-        lineStart: number | null;
-        contentStarted: boolean;
-        contentBuffer: string;
-        linesSent: number;
-        // explain_code incremental state
-        explainStarted: boolean;
-        explainBuffer: string;
-        explainSent: number;
+  const stream = new ReadableStream({
+    async start(controller) {
+      function send(event: string, data: unknown) {
+        controller.enqueue(
+          encoder.encode(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`)
+        );
       }
-    >();
 
-    try {
-      for await (const event of result.fullStream) {
-        switch (event.type) {
-          case "tool-input-start": {
-            calls.set(event.id, {
-              toolName: event.toolName,
-              json: "",
-              metaSent: false,
-              mode: null,
-              lineStart: null,
-              contentStarted: false,
-              contentBuffer: "",
-              linesSent: 0,
-              explainStarted: false,
-              explainBuffer: "",
-              explainSent: 0,
-            });
-            break;
-          }
+      // Send 2KB padding comment to force any compression buffers to flush.
+      // Turbopack's dev server may gzip-buffer the response; this primes the pipe.
+      controller.enqueue(
+        encoder.encode(`: ${"x".repeat(2048)}\n\n`)
+      );
 
-          case "tool-input-delta": {
-            const state = calls.get(event.id);
-            if (!state) break;
+      // Track per-tool-call streaming state
+      const calls = new Map<
+        string,
+        {
+          toolName: string;
+          json: string;
+          // write_code incremental state
+          metaSent: boolean;
+          mode: string | null;
+          lineStart: number | null;
+          contentStarted: boolean;
+          contentBuffer: string;
+          linesSent: number;
+          // explain_code incremental state
+          explainStarted: boolean;
+          explainBuffer: string;
+          explainSent: number;
+        }
+      >();
 
-            state.json += event.delta;
+      try {
+        for await (const event of result.fullStream) {
+          switch (event.type) {
+            case "tool-input-start": {
+              calls.set(event.id, {
+                toolName: event.toolName,
+                json: "",
+                metaSent: false,
+                mode: null,
+                lineStart: null,
+                contentStarted: false,
+                contentBuffer: "",
+                linesSent: 0,
+                explainStarted: false,
+                explainBuffer: "",
+                explainSent: 0,
+              });
+              break;
+            }
 
-            if (state.toolName === "write_code") {
-              if (state.mode === null) {
-                const m = state.json.match(/"mode"\s*:\s*"(insert|overwrite)"/);
-                if (m) state.mode = m[1];
-              }
-              if (state.lineStart === null) {
-                const m = state.json.match(/"line_start"\s*:\s*(\d+)/);
-                if (m) state.lineStart = parseInt(m[1]);
-              }
+            case "tool-input-delta": {
+              const state = calls.get(event.id);
+              if (!state) break;
 
-              if (state.mode && state.lineStart !== null) {
-                if (!state.metaSent) {
-                  await send("meta", { mode: state.mode, line_start: state.lineStart });
-                  state.metaSent = true;
+              state.json += event.delta;
+
+              if (state.toolName === "write_code") {
+                if (state.mode === null) {
+                  const m = state.json.match(/"mode"\s*:\s*"(insert|overwrite)"/);
+                  if (m) state.mode = m[1];
+                }
+                if (state.lineStart === null) {
+                  const m = state.json.match(/"line_start"\s*:\s*(\d+)/);
+                  if (m) state.lineStart = parseInt(m[1]);
                 }
 
-                const contentMatch = state.json.match(/"content"\s*:\s*"/);
-                if (contentMatch) {
-                  const valueStart = contentMatch.index! + contentMatch[0].length;
-                  state.contentStarted = true;
-                  state.contentBuffer = parsePartialJsonString(
+                if (state.mode && state.lineStart !== null) {
+                  if (!state.metaSent) {
+                    send("meta", { mode: state.mode, line_start: state.lineStart });
+                    state.metaSent = true;
+                  }
+
+                  const contentMatch = state.json.match(/"content"\s*:\s*"/);
+                  if (contentMatch) {
+                    const valueStart = contentMatch.index! + contentMatch[0].length;
+                    state.contentStarted = true;
+                    state.contentBuffer = parsePartialJsonString(
+                      state.json.slice(valueStart)
+                    );
+                  }
+
+                  const lines = state.contentBuffer.split("\n");
+                  while (state.linesSent < lines.length - 1) {
+                    send("line", { text: lines[state.linesSent] });
+                    state.linesSent++;
+                  }
+                }
+              } else if (state.toolName === "explain_code") {
+                const explainMatch = state.json.match(/"explanation"\s*:\s*"/);
+                if (explainMatch) {
+                  const valueStart = explainMatch.index! + explainMatch[0].length;
+                  state.explainStarted = true;
+                  state.explainBuffer = parsePartialJsonString(
                     state.json.slice(valueStart)
                   );
                 }
 
-                const lines = state.contentBuffer.split("\n");
-                while (state.linesSent < lines.length - 1) {
-                  await send("line", { text: lines[state.linesSent] });
-                  state.linesSent++;
+                if (state.explainBuffer.length > state.explainSent) {
+                  send("explain_delta", {
+                    text: state.explainBuffer.slice(state.explainSent),
+                  });
+                  state.explainSent = state.explainBuffer.length;
                 }
               }
-            } else if (state.toolName === "explain_code") {
-              const explainMatch = state.json.match(/"explanation"\s*:\s*"/);
-              if (explainMatch) {
-                const valueStart = explainMatch.index! + explainMatch[0].length;
-                state.explainStarted = true;
-                state.explainBuffer = parsePartialJsonString(
-                  state.json.slice(valueStart)
-                );
-              }
-
-              if (state.explainBuffer.length > state.explainSent) {
-                await send("explain_delta", {
-                  text: state.explainBuffer.slice(state.explainSent),
-                });
-                state.explainSent = state.explainBuffer.length;
-              }
-            }
-            break;
-          }
-
-          case "tool-call": {
-            const state = calls.get(event.toolCallId);
-
-            if (event.toolName === "write_code") {
-              const input = event.input as {
-                mode: "insert" | "overwrite";
-                line_start: number;
-                content: string;
-              };
-
-              if (state) {
-                const lines = input.content.split("\n");
-                if (!state.metaSent) {
-                  await send("meta", { mode: input.mode, line_start: input.line_start });
-                }
-                for (let i = state.linesSent; i < lines.length; i++) {
-                  await send("line", { text: lines[i] });
-                }
-              } else {
-                await send("meta", { mode: input.mode, line_start: input.line_start });
-                for (const line of input.content.split("\n")) {
-                  await send("line", { text: line });
-                }
-              }
-
-              await send("write_done", {});
-              await send("tool_call", { tool: event.toolName, args: input });
-            } else if (event.toolName === "explain_code") {
-              const input = event.input as { explanation: string };
-
-              if (state && state.explainSent < input.explanation.length) {
-                await send("explain_delta", {
-                  text: input.explanation.slice(state.explainSent),
-                });
-              } else if (!state) {
-                await send("explain_delta", { text: input.explanation });
-              }
-
-              await send("explain_done", {});
-              await send("tool_call", { tool: event.toolName, args: input });
+              break;
             }
 
-            calls.delete(event.toolCallId);
-            break;
-          }
+            case "tool-call": {
+              const state = calls.get(event.toolCallId);
 
-          case "error":
-            await send("error", { message: String(event.error) });
-            break;
-          case "finish":
-            await send("done", {});
-            break;
+              if (event.toolName === "write_code") {
+                const input = event.input as {
+                  mode: "insert" | "overwrite";
+                  line_start: number;
+                  content: string;
+                };
+
+                if (state) {
+                  const lines = input.content.split("\n");
+                  if (!state.metaSent) {
+                    send("meta", { mode: input.mode, line_start: input.line_start });
+                  }
+                  for (let i = state.linesSent; i < lines.length; i++) {
+                    send("line", { text: lines[i] });
+                  }
+                } else {
+                  send("meta", { mode: input.mode, line_start: input.line_start });
+                  for (const line of input.content.split("\n")) {
+                    send("line", { text: line });
+                  }
+                }
+
+                send("write_done", {});
+                send("tool_call", { tool: event.toolName, args: input });
+              } else if (event.toolName === "explain_code") {
+                const input = event.input as { explanation: string };
+
+                if (state && state.explainSent < input.explanation.length) {
+                  send("explain_delta", {
+                    text: input.explanation.slice(state.explainSent),
+                  });
+                } else if (!state) {
+                  send("explain_delta", { text: input.explanation });
+                }
+
+                send("explain_done", {});
+                send("tool_call", { tool: event.toolName, args: input });
+              }
+
+              calls.delete(event.toolCallId);
+              break;
+            }
+
+            case "error":
+              send("error", { message: String(event.error) });
+              break;
+            case "finish":
+              send("done", {});
+              break;
+          }
         }
+      } catch (err) {
+        send("error", { message: String(err) });
+      } finally {
+        controller.close();
       }
-    } catch (err) {
-      await send("error", { message: String(err) });
-    } finally {
-      await writer.close();
-    }
-  })();
+    },
+  });
 
-  return new Response(readable, {
+  return new Response(stream, {
     headers: {
       "Content-Type": "text/event-stream",
       "Content-Encoding": "identity",
       "Cache-Control": "no-cache, no-transform",
+      "Connection": "keep-alive",
       "X-Accel-Buffering": "no",
     },
   });

@@ -82,7 +82,7 @@ export default function VimTerminal({ onExplainDelta, onExplainStart, onExplainD
                 currentMode = data.mode;
                 // Model gives line_start based on original buffer.
                 // Offset by lines previously inserted before this position.
-                let originalIdx = (data.line_start as number) - 1;
+                const originalIdx = (data.line_start as number) - 1;
                 let offset = 0;
                 for (const ins of completedInserts) {
                   if (ins.at <= originalIdx) {
@@ -143,6 +143,12 @@ export default function VimTerminal({ onExplainDelta, onExplainStart, onExplainD
                 setStatusMessage(`Agent error: ${data.message}`);
                 break;
             }
+
+            // Yield to the browser between events so that each flushSync
+            // paint is actually composited on screen. Without this, multiple
+            // events that arrive in the same reader.read() chunk would all
+            // render in a single paint, defeating the token-by-token effect.
+            await new Promise((r) => setTimeout(r, 0));
           }
         }
       } catch (err) {
