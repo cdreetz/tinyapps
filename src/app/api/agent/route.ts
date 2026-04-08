@@ -3,6 +3,7 @@ import { openai } from "@ai-sdk/openai";
 import { z } from "zod";
 
 export const dynamic = "force-dynamic";
+export const runtime = "edge";
 
 export async function POST(req: Request) {
   const { prompt, buffer, cursor_line } = await req.json();
@@ -68,6 +69,12 @@ TOOL USAGE RULES:
       encoder.encode(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`)
     );
   }
+
+  // Send 2KB padding comment to force any compression buffers to flush.
+  // Turbopack's dev server may gzip-buffer the response; this primes the pipe.
+  await writer.write(
+    encoder.encode(`: ${"x".repeat(2048)}\n\n`)
+  );
 
   // Process fullStream in background, writing SSE events to the transform stream
   (async () => {
